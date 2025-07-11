@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Document Record",
+  "type": "object",
+  "required": [
+    "site", "document_id", "title",
+    "authors", "pub_year", "language",
+    "download_url", "checksum", "scraped_at"
+  ],
+  "properties": {
+    "site": { "type": "string" },
+    "document_id": { "type": "string" },
+    "title": { "type": "string" },
+    "authors": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "pub_year": {
+      "type": "string",
+      "pattern": "^\\d{4}(-\\d{2}-\\d{2})?$"
+    },
+    "language": { "type": "string" },
+    "download_url": { "type": "string", "format": "uri" },
+    "checksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "scraped_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "content": { "type": "string" }
+  },
+  "additionalProperties": false
+}
