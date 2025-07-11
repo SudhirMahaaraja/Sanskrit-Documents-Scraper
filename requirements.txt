@@ -1,0 +1,10 @@
+requests
+beautifulsoup4
+urllib3
+tldextract
+PyPDF2
+pdfminer.six
+pytesseract
+Pillow
+jsonschema
+sqlite3  # built‐in, no install needed
