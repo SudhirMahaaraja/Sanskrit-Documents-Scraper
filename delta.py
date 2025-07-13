@@ -2,74 +2,321 @@ import os
 import sqlite3
 import requests
 import hashlib
+import json
+import logging
 from datetime import datetime
+from urllib.parse import urlparse
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DB_PATH = "delta.db"
 DOWNLOAD_DIR = os.path.join("output", "files")
+OUTPUT_JSONL = os.path.join("output", "records.jsonl")
 
-def sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+
+def sha256_file(path):
+    """Calculate SHA256 hash of a file"""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception as e:
+        logger.error(f"Error calculating hash for {path}: {e}")
+        return None
+
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS docs (
-            url TEXT PRIMARY KEY,
-            last_modified TEXT,
-            checksum TEXT
-        )
-    """)
-    conn.commit()
-    return conn
+    """Initialize the delta tracking database"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+                  CREATE TABLE IF NOT EXISTS docs
+                  (
+                      url
+                      TEXT
+                      PRIMARY
+                      KEY,
+                      last_modified
+                      TEXT,
+                      checksum
+                      TEXT,
+                      file_path
+                      TEXT,
+                      last_checked
+                      TEXT
+                  )
+                  """)
+        conn.commit()
+        logger.info("Database initialized")
+        return conn
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+        return None
+
+
+def get_stored_urls():
+    """Get all URLs currently stored in the database"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT url FROM docs")
+        urls = [row[0] for row in c.fetchall()]
+        conn.close()
+        return urls
+    except Exception as e:
+        logger.error(f"Error getting stored URLs: {e}")
+        return []
+
+
+def extract_urls_from_records():
+    """Extract download URLs from existing records"""
+    urls = set()
+
+    if os.path.exists(OUTPUT_JSONL):
+        try:
+            with open(OUTPUT_JSONL, "r", encoding="utf-8") as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if line:
+                        try:
+                            record = json.loads(line)
+                            download_url = record.get("download_url")
+                            if download_url and download_url.startswith("http"):
+                                urls.add(download_url)
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Invalid JSON on line {line_num}: {e}")
+        except Exception as e:
+            logger.error(f"Error reading {OUTPUT_JSONL}: {e}")
+
+    logger.info(f"Found {len(urls)} URLs from existing records")
+    return list(urls)
+
+
+def check_url_modified(url):
+    """Check if a URL has been modified since last check"""
+    try:
+        # Use proper headers to avoid being blocked
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+
+        response = requests.head(url, headers=headers, timeout=30, allow_redirects=True)
+
+        if response.status_code == 200:
+            last_modified = response.headers.get("Last-Modified")
+            content_length = response.headers.get("Content-Length")
+            etag = response.headers.get("ETag")
+
+            return {
+                'last_modified': last_modified,
+                'content_length': content_length,
+                'etag': etag,
+                'status': 'accessible'
+            }
+        else:
+            logger.warning(f"URL returned status {response.status_code}: {url}")
+            return {'status': 'inaccessible', 'status_code': response.status_code}
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error checking URL {url}: {e}")
+        return {'status': 'error', 'error': str(e)}
+
 
 def process_url(url):
+    """Process a single URL for delta checking"""
     conn = init_db()
-    c = conn.cursor()
-    head = requests.head(url, allow_redirects=True)
-    lm = head.headers.get("Last-Modified")
-    c.execute("SELECT last_modified, checksum FROM docs WHERE url=?", (url,))
-    row = c.fetchone()
+    if not conn:
+        return
 
-    needs = False
-    if row:
-        stored_lm, stored_cs = row
-        if lm and lm != stored_lm:
-            needs = True
-    else:
-        needs = True
+    try:
+        c = conn.cursor()
 
-    if needs:
-        resp = requests.get(url)
-        fname = os.path.basename(url)
-        local_path = os.path.join(DOWNLOAD_DIR, fname)
-        with open(local_path, "wb") as f:
-            f.write(resp.content)
-        new_cs = sha256(local_path)
-        # update
-        c.execute("""
-            INSERT INTO docs(url, last_modified, checksum)
-            VALUES(?,?,?)
-            ON CONFLICT(url) DO UPDATE
-              SET last_modified=excluded.last_modified,
-                  checksum=excluded.checksum
-        """, (url, lm, new_cs))
-        conn.commit()
-        print(f"Processed & updated: {url}")
-    else:
-        print(f"No change: {url}")
+        # Check current status of URL
+        url_info = check_url_modified(url)
+
+        if url_info['status'] != 'accessible':
+            logger.warning(f"URL not accessible: {url}")
+            # Update database with inaccessible status
+            c.execute("""
+                INSERT OR REPLACE INTO docs (url, last_checked, checksum, last_modified)
+                VALUES (?, ?, ?, ?)
+            """, (url, datetime.utcnow().isoformat(), None, None))
+            conn.commit()
+            return
+
+        # Get stored info
+        c.execute("SELECT last_modified, checksum, file_path FROM docs WHERE url=?", (url,))
+        row = c.fetchone()
+
+        needs_download = False
+        reason = ""
+
+        if row:
+            stored_lm, stored_checksum, stored_file_path = row
+            current_lm = url_info.get('last_modified')
+
+            if current_lm and current_lm != stored_lm:
+                needs_download = True
+                reason = "Last-Modified header changed"
+            elif not current_lm:
+                # No Last-Modified header, check if file exists and verify checksum
+                if stored_file_path and os.path.exists(stored_file_path):
+                    current_checksum = sha256_file(stored_file_path)
+                    if current_checksum != stored_checksum:
+                        needs_download = True
+                        reason = "File checksum changed"
+                else:
+                    needs_download = True
+                    reason = "Local file missing"
+        else:
+            needs_download = True
+            reason = "New URL"
+
+        if needs_download:
+            logger.info(f"Downloading {url} - {reason}")
+
+            # Download the file
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+
+                response = requests.get(url, headers=headers, timeout=60, stream=True)
+                response.raise_for_status()
+
+                # Generate filename
+                filename = os.path.basename(urlparse(url).path)
+                if not filename or not filename.endswith('.pdf'):
+                    filename = f"download_{hashlib.sha256(url.encode()).hexdigest()[:8]}.pdf"
+
+                file_path = os.path.join(DOWNLOAD_DIR, filename)
+
+                # Download with progress
+                with open(file_path, "wb") as f:
+                    downloaded = 0
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+                # Calculate new checksum
+                new_checksum = sha256_file(file_path)
+
+                # Update database
+                c.execute("""
+                    INSERT OR REPLACE INTO docs (url, last_modified, checksum, file_path, last_checked)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (url, url_info.get('last_modified'), new_checksum, file_path, datetime.utcnow().isoformat()))
+
+                conn.commit()
+
+                logger.info(f"Successfully downloaded: {url} -> {file_path} ({downloaded} bytes)")
+
+            except Exception as e:
+                logger.error(f"Error downloading {url}: {e}")
+        else:
+            logger.info(f"No changes detected for: {url}")
+
+            # Update last checked time
+            c.execute("""
+                      UPDATE docs
+                      SET last_checked = ?
+                      WHERE url = ?
+                      """, (datetime.utcnow().isoformat(), url))
+            conn.commit()
+
+    except Exception as e:
+        logger.error(f"Error processing URL {url}: {e}")
+    finally:
+        conn.close()
+
+
+def process_all_urls():
+    """Process all known URLs for delta checking"""
+    # Get URLs from existing records
+    urls = extract_urls_from_records()
+
+    if not urls:
+        logger.warning("No URLs found to process")
+        logger.info("Make sure you have run the crawler and metadata extractor first")
+        return
+
+    logger.info(f"Processing {len(urls)} URLs for delta checking")
+
+    for i, url in enumerate(urls, 1):
+        logger.info(f"Processing URL {i}/{len(urls)}: {url}")
+        process_url(url)
+
+        # Small delay to be respectful
+        import time
+        time.sleep(1)
+
+
+def show_database_status():
+    """Show current database status"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        c.execute("SELECT COUNT(*) FROM docs")
+        total_count = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM docs WHERE checksum IS NOT NULL")
+        downloaded_count = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM docs WHERE last_checked IS NOT NULL")
+        checked_count = c.fetchone()[0]
+
+        logger.info(f"Database status:")
+        logger.info(f"  Total URLs tracked: {total_count}")
+        logger.info(f"  Successfully downloaded: {downloaded_count}")
+        logger.info(f"  Last checked: {checked_count}")
+
+        # Show recent activity
+        c.execute(
+            "SELECT url, last_checked FROM docs WHERE last_checked IS NOT NULL ORDER BY last_checked DESC LIMIT 5")
+        recent = c.fetchall()
+
+        if recent:
+            logger.info("Recent activity:")
+            for url, last_checked in recent:
+                logger.info(f"  {last_checked}: {url}")
+
+        conn.close()
+
+    except Exception as e:
+        logger.error(f"Error showing database status: {e}")
+
+
+def main():
+    """Main function"""
+    logger.info("Starting delta processing...")
+
+    # Create download directory if it doesn't exist
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    # Initialize database
+    conn = init_db()
+    if not conn:
+        logger.error("Could not initialize database")
+        return
     conn.close()
 
+    # Show current status
+    show_database_status()
+
+    # Process all URLs
+    process_all_urls()
+
+    # Show final status
+    logger.info("Delta processing complete")
+    show_database_status()
+
+
 if __name__ == "__main__":
-    # Example usage: re‐process all known URLs from a file or list
-    urls = []
-    for f in os.listdir(DOWNLOAD_DIR):
-        if "_" in f:
-            urls.append(f)
-    # In practice, keep a list of source URLs instead of filenames
-    for u in urls:
-        process_url(u)
+    main()
