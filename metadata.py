@@ -30,8 +30,11 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-OUTPUT_JSONL = os.path.join("output", "records.jsonl")
-os.makedirs(os.path.dirname(OUTPUT_JSONL), exist_ok=True)
+METADATA_JSONL = os.path.join("output", "metadata_records.jsonl")
+CRAWLING_RECORDS_JSON = os.path.join("output", "crawling_records.json")
+
+os.makedirs(os.path.dirname(METADATA_JSONL), exist_ok=True)
+os.makedirs(os.path.dirname(CRAWLING_RECORDS_JSON), exist_ok=True)
 
 
 def sha256_of_file(path):
@@ -138,34 +141,37 @@ def extract_pdf_metadata(path):
     return title, '', None
 
 
-def build_record(file_path, source_url=None):
-    """Build a metadata record for a file"""
+def build_metadata_record(file_path, crawling_info):
+    """
+    Build a metadata record for a file using extracted PDF metadata
+    and crawling information.
+    """
     try:
         # Basic file info
         filename = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
 
-        logger.info(f"Processing: {filename} ({file_size} bytes)")
+        logger.info(f"Building metadata for: {filename} ({file_size} bytes)")
 
         # Skip if file is too small (likely an error page)
         if file_size < 1024:
-            logger.warning(f"File too small, skipping: {filename}")
+            logger.warning(f"File too small, skipping metadata for: {filename}")
             return None
 
         # Calculate checksum
         checksum = sha256_of_file(file_path)
         if not checksum:
-            logger.error(f"Could not calculate checksum for {filename}")
+            logger.error(f"Could not calculate checksum for {filename}, skipping metadata.")
             return None
 
-        # Extract metadata
+        # Extract metadata from PDF (author, pub_year, title)
         title, author, pub_year = extract_pdf_metadata(file_path)
 
-        # Use filename as fallback title
+        # Use filename as fallback title if not extracted from PDF
         if not title:
             title = filename.replace('.pdf', '').replace('_', ' ')
 
-        # Use file modification time as fallback date
+        # Use file modification time as fallback date if not extracted from PDF
         if not pub_year:
             try:
                 file_mtime = os.path.getmtime(file_path)
@@ -173,13 +179,15 @@ def build_record(file_path, source_url=None):
             except Exception:
                 pub_year = datetime.now().strftime('%Y-%m-%d')
 
-        # Determine source domain
-        if source_url:
-            domain = urlparse(source_url).netloc
+        # Get download_url and site from crawling_info
+        download_url = crawling_info.get('original_download_url')
+        if download_url:
+            domain = urlparse(download_url).netloc
         else:
-            domain = "local"
+            domain = "local"  # Fallback if URL is missing in crawling info
+            download_url = f"file://{os.path.abspath(file_path)}"  # Default to local file URL
 
-        # Build record
+        # Build metadata record
         record = {
             "site": domain,
             "document_id": os.path.splitext(filename)[0],
@@ -187,7 +195,7 @@ def build_record(file_path, source_url=None):
             "authors": [author] if author else [],
             "pub_year": pub_year,
             "language": "Sanskrit",  # Default for this project
-            "download_url": source_url or f"file://{file_path}",
+            "download_url": download_url,
             "checksum": checksum,
             "file_size": file_size,
             "scraped_at": datetime.utcnow().isoformat() + "Z"
@@ -196,21 +204,45 @@ def build_record(file_path, source_url=None):
         return record
 
     except Exception as e:
-        logger.error(f"Error building record for {file_path}: {e}")
+        logger.error(f"Error building metadata record for {file_path}: {e}")
         return None
 
 
-def append_record(record):
-    """Append a record to the JSONL file"""
+def append_metadata_record(record):
+    """Append a metadata record to the JSONL file"""
     if not record:
         return
 
     try:
-        with open(OUTPUT_JSONL, "a", encoding="utf-8") as f:
+        with open(METADATA_JSONL, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        logger.info(f"Recorded: {record['document_id']}")
+        logger.info(f"Appended metadata for: {record['document_id']}")
     except Exception as e:
-        logger.error(f"Error writing record: {e}")
+        logger.error(f"Error writing metadata record: {e}")
+
+
+def load_crawling_records_map():
+    """
+    Load crawling records from crawling_records.json and return a dictionary
+    mapping local file paths to their crawling information.
+    """
+    crawling_data_map = {}
+    if os.path.exists(CRAWLING_RECORDS_JSON) and os.path.getsize(CRAWLING_RECORDS_JSON) > 0:
+        try:
+            with open(CRAWLING_RECORDS_JSON, "r", encoding="utf-8") as f:
+                records = json.load(f)
+                for record in records:
+                    if 'local_file_path' in record:
+                        # Normalize path to ensure consistent lookup, relative to current working dir
+                        normalized_local_path = os.path.normpath(record['local_file_path'])
+                        crawling_data_map[normalized_local_path] = record
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding {CRAWLING_RECORDS_JSON}: {e}. File might be corrupted or empty.")
+        except Exception as e:
+            logger.error(f"Error loading crawling records: {e}")
+    else:
+        logger.warning(f"Crawling records file not found or empty: {CRAWLING_RECORDS_JSON}")
+    return crawling_data_map
 
 
 def process_all_files():
@@ -221,31 +253,47 @@ def process_all_files():
         logger.error(f"Directory not found: {files_dir}")
         return
 
-    files = os.listdir(files_dir)
-    pdf_files = [f for f in files if f.lower().endswith('.pdf')]
+    # Load crawling records to get source URLs and other crawling info
+    crawling_records_map = load_crawling_records_map()
+    logger.info(f"Loaded {len(crawling_records_map)} crawling records for lookup.")
 
-    logger.info(f"Found {len(pdf_files)} PDF files to process")
+    pdf_files_in_dir = [f for f in os.listdir(files_dir) if f.lower().endswith('.pdf')]
 
-    successful = 0
+    logger.info(f"Found {len(pdf_files_in_dir)} PDF files to process for metadata extraction.")
+
+    successful_metadata = 0
     failed = 0
 
-    for filename in pdf_files:
+    for filename in pdf_files_in_dir:
         file_path = os.path.join(files_dir, filename)
+
+        # Normalize the file_path to match how it might be stored in crawling_records.json
+        # E.g., if crawling_records.json stores "output/files/my_doc.pdf"
+        normalized_current_file_path = os.path.normpath(file_path)
+
+        crawling_info = crawling_records_map.get(normalized_current_file_path)
+
+        if not crawling_info:
+            logger.warning(
+                f"No crawling record found for {filename} at path {normalized_current_file_path}. Skipping metadata generation for this file.")
+            failed += 1
+            continue
+
         try:
-            record = build_record(file_path)
+            record = build_metadata_record(file_path, crawling_info)
             if record:
-                append_record(record)
-                successful += 1
+                append_metadata_record(record)
+                successful_metadata += 1
             else:
                 failed += 1
         except Exception as e:
             logger.error(f"Error processing {filename}: {e}")
             failed += 1
 
-    logger.info(f"Processing complete. Successful: {successful}, Failed: {failed}")
+    logger.info(f"Processing complete. Successful metadata records: {successful_metadata}, Failed: {failed}")
 
 
 if __name__ == "__main__":
-    logger.info("Starting metadata extraction...")
+    logger.info("Starting metadata extraction from PDF files using crawling records...")
     process_all_files()
     logger.info("Metadata extraction complete.")
